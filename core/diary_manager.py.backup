@@ -1,0 +1,1005 @@
+"""
+日记管理器 - 核心逻辑模块
+负责日记数据的存储、检索和触发判断
+"""
+
+import asyncio
+import json
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Any
+
+from src.common.logger import get_logger
+
+logger = get_logger("continuous_diary.manager")
+
+
+class DiaryManager:
+    """日记管理器核心类"""
+
+    def __init__(self, data_dir: Path, config: dict):
+        self.data_dir = data_dir
+        self.data_dir.mkdir(parents=True, exist_ok=True)
+        self.config = config
+
+        # 读取配置
+        self.enabled_chat_types = config.get("enabled_chat_types", ["group", "private"])
+        
+        # 群聊触发配置
+        self.group_trigger_type = config.get("group_trigger_type", "both")
+        self.group_message_threshold = config.get("group_message_threshold", 50)
+        self.group_time_interval_hours = config.get("group_time_interval_hours", 6)
+        
+        # 私聊触发配置
+        self.private_trigger_type = config.get("private_trigger_type", "message")
+        self.private_message_threshold = config.get("private_message_threshold", 30)
+        self.private_time_interval_hours = config.get("private_time_interval_hours", 12)
+        
+        # 字数限制（按自然天分层）
+        self.today_max_words = config.get("today_max_words", 2000)
+        self.yesterday_max_words = config.get("yesterday_max_words", 1000)
+        self.older_max_words = config.get("older_max_words", 500)
+        
+        # 存储配置（存在插件自己的目录下）
+        self.retention_days = config.get("retention_days", 3)
+        
+        # 模型上下文限制（单位：k tokens）
+        self.model_context_limit_k = config.get("model_context_limit_k", 100)
+        self.model_context_limit = self.model_context_limit_k * 1000  # 转为tokens
+        
+        plugin_dir = Path(__file__).parent.parent  # 插件根目录
+        self.data_dir = plugin_dir / "data"
+        self.data_dir.mkdir(parents=True, exist_ok=True)
+        self.max_summaries = 50  # 最多保留的总结数量（今天可能有多次增量总结）
+
+        # 文件锁（确保并发安全）
+        self._locks: dict[str, asyncio.Lock] = {}
+
+        logger.info(
+            f"[DiaryManager] 初始化完成\n"
+            f"  群聊触发: {self.group_trigger_type} (消息≥{self.group_message_threshold}, 时间≥{self.group_time_interval_hours}h)\n"
+            f"  私聊触发: {self.private_trigger_type} (消息≥{self.private_message_threshold}, 时间≥{self.private_time_interval_hours}h)\n"
+            f"  触发模式: time=仅时间 | message=仅消息 | both=都满足(AND) | any=任一(OR)\n"
+            f"  字数限制: 今{self.today_max_words} 昨{self.yesterday_max_words} 前{self.older_max_words}\n"
+            f"  存储路径: {self.data_dir} (保留{self.retention_days}天)\n"
+            f"  模型上下文: {self.model_context_limit_k}k tokens (超过后均匀分段)\n"
+            f"  数据结构: v3.0 - 每天独立文件，包含详细版+昨天版+前天版"
+        )
+    
+    def _estimate_tokens(self, text: str) -> int:
+        """估算文本的token数（粗略）
+        
+        Args:
+            text: 要估算的文本
+            
+        Returns:
+            int: 估算的token数
+        """
+        # 中文约1.5个字符=1个token，英文约4个字符=1个token
+        # 这里采用简化估算：平均1.5个字符=1token
+        return int(len(text) / 1.5)
+    
+    def _calculate_even_segments(self, total_items: int, estimated_tokens: int) -> int:
+        """计算需要分几段才能均匀分配
+        
+        Args:
+            total_items: 总项目数（消息或总结数）
+            estimated_tokens: 估算的总 token 数
+            
+        Returns:
+            int: 需要分的段数
+        """
+        if estimated_tokens <= self.model_context_limit:
+            return 1
+        
+        # 计算需要分几段
+        segments_needed = (estimated_tokens + self.model_context_limit - 1) // self.model_context_limit
+        return segments_needed
+
+    def _get_lock(self, conversation_id: str) -> asyncio.Lock:
+        """获取对话的锁对象"""
+        if conversation_id not in self._locks:
+            self._locks[conversation_id] = asyncio.Lock()
+        return self._locks[conversation_id]
+    
+    async def _get_conversation_info(self, stream_id: str) -> tuple[str, str, str]:
+        """从stream_id获取对话信息
+        
+        Args:
+            stream_id: ChatStream的ID（哈希值）
+            
+        Returns:
+            tuple: (chat_type, object_id, object_name)
+                chat_type: "group" 或 "private"
+                object_id: 群号或用户ID
+                object_name: 群名或用户昵称
+        """
+        try:
+            from src.chat.message_receive.chat_stream import get_chat_manager
+            
+            chat_manager = get_chat_manager()
+            chat_stream = await chat_manager.get_stream(stream_id)
+            
+            if not chat_stream:
+                logger.warning(f"[DiaryManager] 无法获取ChatStream: {stream_id[:16]}...")
+                return "unknown", stream_id[:16], "未知对话"
+            
+            # 判断是群聊还是私聊
+            if chat_stream.group_info:
+                chat_type = "group"
+                object_id = str(chat_stream.group_info.group_id)
+                object_name = chat_stream.group_info.group_name or f"群{object_id}"
+            elif chat_stream.user_info:
+                chat_type = "private"
+                object_id = str(chat_stream.user_info.user_id)
+                # DatabaseUserInfo可能没有nickname属性，尝试获取name
+                user_name = getattr(chat_stream.user_info, 'nickname', None) or \
+                           getattr(chat_stream.user_info, 'name', None) or \
+                           f"用户{object_id}"
+                object_name = user_name
+            else:
+                chat_type = "unknown"
+                object_id = stream_id[:16]
+                object_name = "未知对话"
+            
+            # 清理名称中的非法字符
+            object_name = self._sanitize_filename(object_name)
+            
+            return chat_type, object_id, object_name
+            
+        except Exception as e:
+            logger.error(f"[DiaryManager] 获取对话信息失败: {e}")
+            return "unknown", stream_id[:16], "未知对话"
+    
+    def _sanitize_filename(self, name: str) -> str:
+        """清理文件名中的非法字符"""
+        # 移除Windows/Linux文件名非法字符
+        illegal_chars = r'<>:"/\\|?*'
+        for char in illegal_chars:
+            name = name.replace(char, "_")
+        # 限制长度
+        if len(name) > 50:
+            name = name[:50]
+        return name
+
+    async def _get_conversation_folder(self, stream_id: str) -> Path:
+        """获取对话的文件夹路径
+        
+        结构: data/continuous_diary/{chat_type}/{object_id}_{object_name}/
+        例如: data/continuous_diary/group/169850076_墨狐狐起源之地/
+        """
+        chat_type, object_id, object_name = await self._get_conversation_info(stream_id)
+        
+        # 构建文件夹路径
+        type_folder = self.data_dir / chat_type
+        conversation_folder = type_folder / f"{object_id}_{object_name}"
+        
+        # 确保文件夹存在
+        conversation_folder.mkdir(parents=True, exist_ok=True)
+        
+        return conversation_folder
+    
+    async def _get_conversation_file(self, stream_id: str, date: str | None = None) -> Path:
+        """获取对话的数据文件路径
+        
+        Args:
+            stream_id: ChatStream的ID
+            date: 日期字符串(YYYY-MM-DD)，如果为None则返回今天的文件
+            
+        Returns:
+            Path: 文件路径，例如 .../group/169850076_墨狐狐起源之地/2026-01-06.json
+        """
+        folder = await self._get_conversation_folder(stream_id)
+        
+        if date is None:
+            date = datetime.now().strftime("%Y-%m-%d")
+        
+        return folder / f"{date}.json"
+    
+    async def _get_metadata_file(self, stream_id: str) -> Path:
+        """获取对话的元数据文件路径"""
+        folder = await self._get_conversation_folder(stream_id)
+        return folder / "metadata.json"
+    
+    async def _load_metadata(self, stream_id: str) -> dict:
+        """加载对话的元数据"""
+        metadata_file = await self._get_metadata_file(stream_id)
+        
+        if metadata_file.exists():
+            try:
+                with open(metadata_file, encoding="utf-8") as f:
+                    return json.load(f)
+            except Exception as e:
+                logger.error(f"[DiaryManager] 加载元数据失败: {e}")
+        
+        # 返回默认元数据
+        return {
+            "stream_id": stream_id,
+            "created_at": datetime.now().isoformat(),
+            "last_updated": datetime.now().isoformat(),
+        }
+    
+    async def _save_metadata(self, stream_id: str, metadata: dict):
+        """保存对话的元数据"""
+        metadata_file = await self._get_metadata_file(stream_id)
+        metadata["last_updated"] = datetime.now().isoformat()
+        
+        try:
+            with open(metadata_file, "w", encoding="utf-8") as f:
+                json.dump(metadata, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            logger.error(f"[DiaryManager] 保存元数据失败: {e}")
+
+    async def _load_conversation(self, stream_id: str, date: str | None = None) -> dict[str, Any]:
+        """加载或创建对话数据
+        
+        Args:
+            stream_id: ChatStream的ID
+            date: 要加载的日期(YYYY-MM-DD)，None表示今天
+            
+        Returns:
+            dict: 对话数据
+        """
+        file_path = await self._get_conversation_file(stream_id, date)
+
+        if file_path.exists():
+            try:
+                with open(file_path, encoding="utf-8") as f:
+                    data = json.load(f)
+                
+                # 自动修复/升级数据结构
+                data = self._ensure_data_structure(data, stream_id)
+                return data
+            except Exception as e:
+                logger.error(
+                    f"[DiaryManager] 加载对话数据失败 {stream_id[:16]}... {date}: {e}，"
+                    f"将创建新的数据结构",
+                    exc_info=True
+                )
+
+        # 创建新的对话数据结构
+        return self._create_new_data_structure(stream_id)
+    
+    def _create_new_data_structure(self, conversation_id: str) -> dict[str, Any]:
+        """创建新的v3.0数据结构
+        
+        每天一个文件，包含：
+        - detailed_summaries: 当天的多个增量总结（详细版）
+        - yesterday_version: 作为"昨天"呈现的完整版本
+        - older_version: 作为"前天"呈现的精简版本
+        """
+        return {
+            "conversation_id": conversation_id,
+            "date": datetime.now().strftime("%Y-%m-%d"),  # 本文件对应的日期
+            "detailed_summaries": [],  # 当天的多个增量总结（详细版）
+            "yesterday_version": None,  # 作为"昨天"的完整版本
+            "older_version": None,      # 作为"前天"的精简版本
+            "last_summary_time": None,  # 最后一次总结的时间
+            "metadata": {
+                "created_at": datetime.now().isoformat(),
+                "updated_at": datetime.now().isoformat(),
+                "total_summaries": 0,
+                "version": "3.0",
+            },
+        }
+    
+    def _ensure_data_structure(self, data: dict, conversation_id: str) -> dict:
+        """确保数据结构完整（v3.0）"""
+        version = data.get("metadata", {}).get("version", "unknown")
+        
+        # 如果是旧版本，直接重建
+        if version != "3.0":
+            logger.warning(f"[DiaryManager] 检测到非v3.0数据 (v{version})，重建为v3.0: {conversation_id[:16]}...")
+            return self._create_new_data_structure(conversation_id)
+        
+        # 确保etailed_summaries是list
+        if not isinstance(data.get("detailed_summaries"), list):
+            data["detailed_summaries"] = []
+        
+        # 确俛yesterday_version和older_version存在
+        if "yesterday_version" not in data:
+            data["yesterday_version"] = None
+        if "older_version" not in data:
+            data["older_version"] = None
+        if "date" not in data:
+            data["date"] = datetime.now().strftime("%Y-%m-%d")
+        if "last_summary_time" not in data:
+            data["last_summary_time"] = None
+        
+        # 确保metadata存在
+        if "metadata" not in data:
+            data["metadata"] = {
+                "created_at": datetime.now().isoformat(),
+                "updated_at": datetime.now().isoformat(),
+                "total_summaries": 0,
+                "version": "3.0",
+            }
+        else:
+            data["metadata"]["version"] = "3.0"
+            data["metadata"]["updated_at"] = datetime.now().isoformat()
+        
+        return data
+
+    async def _save_conversation(self, stream_id: str, conv_data: dict, date: str | None = None):
+        """保存对话数据
+        
+        Args:
+            stream_id: ChatStream的ID
+            conv_data: 对话数据
+            date: 保存的日期(YYYY-MM-DD)，None表示今天
+        """
+        file_path = await self._get_conversation_file(stream_id, date)
+
+        try:
+            with open(file_path, "w", encoding="utf-8") as f:
+                json.dump(conv_data, f, ensure_ascii=False, indent=2)
+            
+            # 同时更新元数据
+            metadata = await self._load_metadata(stream_id)
+            await self._save_metadata(stream_id, metadata)
+        except Exception as e:
+            logger.error(f"[DiaryManager] 保存对话数据失败 {stream_id[:16]}... {date}: {e}")
+
+    async def add_message(self, conversation_id: str, message: dict, chat_type: str) -> bool:
+        """
+        添加新消息到待处理队列
+
+        Args:
+            conversation_id: 对话ID（群号或私聊用户ID）
+            message: 消息字典，包含 time, sender, content 等字段
+            chat_type: 聊天类型 "group" 或 "private"
+
+        Returns:
+            bool: 是否应该触发总结
+        """
+        async with self._get_lock(conversation_id):
+            conv_data = await self._load_conversation(conversation_id)
+            
+            # 检查是否跨天（需要进行日终总结）
+            # 注意：这里可能调用LLM，如果失败也会继续执行
+            try:
+                await self._check_and_do_daily_summary(conv_data, conversation_id, chat_type)
+            except Exception as e:
+                logger.error(
+                    f"[DiaryManager] 跨天检查/日终总结时发生异常: {e}，"
+                    f"继续处理新消息",
+                    exc_info=True
+                )
+                # 即使日终总结失败，也要继续处理新消息
+
+            # 添加到pending
+            conv_data["pending_messages"].append(message)
+            conv_data["metadata"]["total_messages"] += 1
+
+            # 检查是否需要触发今天的增量总结
+            should_trigger = await self._should_trigger_summary(conv_data, chat_type)
+
+            if should_trigger:
+                logger.info(
+                    f"[DiaryManager] {chat_type} {conversation_id} 触发今天的增量总结，"
+                    f"待处理消息数: {len(conv_data['pending_messages'])}"
+                )
+
+            # 保存（无论日终总结是否成功，都要保存新消息）
+            await self._save_conversation(conversation_id, conv_data)
+
+            return should_trigger
+
+    async def _check_and_do_daily_summary(
+        self, conv_data: dict, conversation_id: str, chat_type: str
+    ):
+        """
+        检查是否跨天，如果跨天则进行日终总结
+        - 昨天的总结（如果今天是新的一天）
+        - 前天的总结（如果有昨天的数据需要归档）
+        - 健壮性：支持多天未开机、LLM失败重试等情况
+        """
+        today_str = datetime.now().strftime("%Y-%m-%d")
+        last_date = conv_data.get("last_summary_date")
+        
+        if not last_date:
+            # 首次运行，记录今天的日期
+            conv_data["last_summary_date"] = today_str
+            logger.info(f"[DiaryManager] 首次记录日期: {today_str}")
+            return
+        
+        if last_date == today_str:
+            # 还是今天，不需要日终总结
+            return
+        
+        # 跨天了！计算跨了几天
+        from datetime import datetime as dt, timedelta
+        
+        last_dt = dt.strptime(last_date, "%Y-%m-%d")
+        today_dt = dt.strptime(today_str, "%Y-%m-%d")
+        days_diff = (today_dt - last_dt).days
+        
+        logger.info(
+            f"[DiaryManager] 检测到跨天 ({last_date} -> {today_str}, {days_diff}天)，"
+            f"开始进行日终总结 {conversation_id}"
+        )
+        
+        # 处理多天跨越（如bot多天未开机）
+        if days_diff > 1:
+            logger.warning(
+                f"[DiaryManager] 跨越了{days_diff}天，将执行多层归档 "
+                f"(today→yesterday→older，多余的将丢弃)"
+            )
+        
+        # 1. 昨天的数据移到前天（多天跨越时，旧的前天会被覆盖）
+        if conv_data["summaries"]["yesterday"]:
+            conv_data["summaries"]["older"] = conv_data["summaries"]["yesterday"]
+            logger.debug(f"[DiaryManager] 昨天的总结归档为前天")
+        
+        # 2. 今天的数据（pending + today列表）总结为"昨天"
+        # 重要：即使跨多天，也只处理最后那天的数据
+        has_data_to_summarize = (
+            conv_data["pending_messages"] or conv_data["summaries"]["today"]
+        )
+        
+        if has_data_to_summarize:
+            from .diary_summarizer import DiarySummarizer
+            
+            summarizer = DiarySummarizer(self.config)
+            
+            # 获取身份信息（从metadata或使用默认值）
+            identity = conv_data["metadata"].get("identity", "")
+            if not identity:
+                # 如果没有保存的identity，使用占位符
+                identity = "一个AI助手"
+                logger.warning(
+                    f"[DiaryManager] 未找到保存的identity，使用默认值"
+                )
+            
+            conversation_type = chat_type
+            
+            try:
+                # 准备今天的所有内容（pending + today的增量总结）
+                all_content_parts = []
+                
+                # 1. 先处理pending的消息（如果有）
+                if conv_data["pending_messages"]:
+                    logger.debug(
+                        f"[DiaryManager] 日终总结前还有{len(conv_data['pending_messages'])}条pending消息，先生成最后一次增量总结"
+                    )
+                    # 估算并分段（如果需要）
+                    pending_text = "\n".join(
+                        f"{m.get('sender', '')}: {m.get('content', '')}"
+                        for m in conv_data["pending_messages"]
+                    )
+                    pending_tokens = self._estimate_tokens(pending_text)
+                    pending_count = len(conv_data["pending_messages"])
+                    segments_needed = self._calculate_even_segments(pending_count, pending_tokens)
+                    
+                    if segments_needed > 1:
+                        segment_summaries = []
+                        items_per_segment = pending_count // segments_needed
+                        remainder = pending_count % segments_needed
+                        start_idx = 0
+                        
+                        for i in range(segments_needed):
+                            segment_size = items_per_segment + (1 if i < remainder else 0)
+                            end_idx = start_idx + segment_size
+                            segment_msgs = conv_data["pending_messages"][start_idx:end_idx]
+                            
+                            segment_summary = await summarizer.generate_summary(
+                                messages=segment_msgs,
+                                identity=identity,
+                                conversation_type=conversation_type,
+                            )
+                            segment_summaries.append(segment_summary["diary_content"])
+                            start_idx = end_idx
+                        
+                        merged_pending = await summarizer.merge_segment_summaries(
+                            segment_summaries=segment_summaries,
+                            identity=identity,
+                            conversation_type=conversation_type,
+                            max_words=self.today_max_words,
+                        )
+                        all_content_parts.append(merged_pending)
+                    else:
+                        last_summary = await summarizer.generate_summary(
+                            messages=conv_data["pending_messages"],
+                            identity=identity,
+                            conversation_type=conversation_type,
+                        )
+                        all_content_parts.append(last_summary["diary_content"])
+                    
+                    conv_data["pending_messages"] = []
+                
+                # 2. 收集今天已有的增量总结
+                today_summaries = conv_data["summaries"]["today"]
+                if today_summaries:
+                    for summary in today_summaries:
+                        all_content_parts.append(summary.get("diary_content", ""))
+                    logger.debug(f"[DiaryManager] 收集了{len(today_summaries)}个今天的增量总结")
+                
+                # 3. 合并为完整的昨天总结
+                if all_content_parts:
+                    # 估算总token数
+                    all_content_text = "\n\n---\n\n".join(all_content_parts)
+                    total_tokens = self._estimate_tokens(all_content_text)
+                    total_parts = len(all_content_parts)
+                    
+                    # 计算需要分几段
+                    segments_needed = self._calculate_even_segments(total_parts, total_tokens)
+                    
+                    if segments_needed > 1:
+                        logger.info(
+                            f"[DiaryManager] 内容估算{total_tokens}tokens，超过{self.model_context_limit}tokens限制，"
+                            f"将均匀分{segments_needed}段合并"
+                        )
+                        
+                        # 均匀分段合并
+                        items_per_segment = total_parts // segments_needed
+                        remainder = total_parts % segments_needed
+                        start_idx = 0
+                        intermediate_summaries = []
+                        
+                        for i in range(segments_needed):
+                            segment_size = items_per_segment + (1 if i < remainder else 0)
+                            end_idx = start_idx + segment_size
+                            segment_parts = all_content_parts[start_idx:end_idx]
+                            segment_content = "\n\n---\n\n".join(segment_parts)
+                            
+                            intermediate_summary = await summarizer.consolidate_daily_summary(
+                                daily_content=segment_content,
+                                date=last_date,
+                                identity=identity,
+                                conversation_type=conversation_type,
+                                max_words=self.yesterday_max_words,
+                            )
+                            intermediate_summaries.append(intermediate_summary["diary_content"])
+                            
+                            logger.debug(f"[DiaryManager] 完成第{i + 1}/{segments_needed}段日终合并")
+                            start_idx = end_idx
+                        
+                        # 最终合并
+                        if len(intermediate_summaries) > 1:
+                            final_content = "\n\n---\n\n".join(intermediate_summaries)
+                            yesterday_summary = await summarizer.consolidate_daily_summary(
+                                daily_content=final_content,
+                                date=last_date,
+                                identity=identity,
+                                conversation_type=conversation_type,
+                                max_words=self.yesterday_max_words,
+                            )
+                        else:
+                            yesterday_summary = {
+                                "id": f"daily_{last_date}",
+                                "date": last_date,
+                                "diary_content": intermediate_summaries[0],
+                                "created_at": datetime.now().isoformat(),
+                            }
+                    else:
+                        # 直接合并
+                        yesterday_summary = await summarizer.consolidate_daily_summary(
+                            daily_content=all_content_text,
+                            date=last_date,
+                            identity=identity,
+                            conversation_type=conversation_type,
+                            max_words=self.yesterday_max_words,
+                        )
+                    
+                    # 保存为昨天的总结
+                    conv_data["summaries"]["yesterday"] = yesterday_summary
+                    conv_data["summaries"]["today"] = []
+                    
+                    logger.info(
+                        f"[DiaryManager] ✅ 日终总结完成，共处理{total_parts}段内容，"
+                        f"估算{total_tokens}tokens，最终字数: {len(yesterday_summary['diary_content'])}"
+                    )
+                else:
+                    logger.info(f"[DiaryManager] 跨天但无内容需要总结")
+                    conv_data["summaries"]["yesterday"] = None
+                    conv_data["summaries"]["today"] = []
+            
+            except Exception as e:
+                logger.error(
+                    f"[DiaryManager] ❌ 日终总结失败: {e}，"
+                    f"数据已保留，下次跨天时会重试",
+                    exc_info=True
+                )
+        else:
+            # 没有数据需要总结（可能是bot很久没用）
+            logger.info(
+                f"[DiaryManager] 跨天但无数据需要总结，直接更新日期标记"
+            )
+        
+        # 3. 更新日期标记到今天（即使失败也更新，避免重复尝试）
+        conv_data["last_summary_date"] = today_str
+        logger.debug(f"[DiaryManager] 日期标记已更新为: {today_str}")
+        
+        # 4. 清理超期数据（超过retention_days）
+        await self._cleanup_old_daily_summaries(conv_data)
+
+    async def _cleanup_old_daily_summaries(self, conv_data: dict):
+        """清理超过保留天数的总结"""
+        if self.retention_days <= 2:
+            # 至少保留昨天和前天
+            return
+        
+        # 如果retention_days=3，只保留今天+昨天+前天，older超期清除
+        # 如果retention_days>3，older也保留（但这个设计里只有3层）
+        if self.retention_days == 3:
+            # 标准3天模式，older保留
+            pass
+        else:
+            # 如果用户设置retention_days>3，也不需要特殊处理（已经是3层了）
+            pass
+
+    async def _should_trigger_summary(self, conv_data: dict, chat_type: str) -> bool:
+        """判断是否触发总结（支持4种模式：time/message/both/any）
+        
+        Args:
+            conv_data: 对话数据
+            chat_type: 聊天类型 "group" 或 "private"
+            
+        Returns:
+            bool: 是否应该触发总结
+        """
+        last_summary_time = conv_data.get("last_summary_time")
+        
+        # 根据聊天类型选择配置
+        if chat_type == "group":
+            trigger_type = self.group_trigger_type
+            message_threshold = self.group_message_threshold
+            time_interval = self.group_time_interval_hours
+        else:  # private
+            trigger_type = self.private_trigger_type
+            message_threshold = self.private_message_threshold
+            time_interval = self.private_time_interval_hours
+        
+        message_ready = False
+        time_ready = False
+        
+        # 条件1：消息数达到阈值
+        if trigger_type in ["message", "both", "any"]:
+            # 从数据库实时查询待处理消息数
+            pending_count = await self.get_pending_count(conv_data.get("conversation_id", ""))
+            if pending_count >= message_threshold:
+                message_ready = True
+                logger.debug(
+                    f"[DiaryManager] {chat_type} 消息数达标: {pending_count}/{message_threshold}")
+
+        # 条件2：时间间隔达到阈值
+        if trigger_type in ["time", "both", "any"]:
+            if last_summary_time:
+                last_time = datetime.fromisoformat(last_summary_time)
+                hours_passed = (datetime.now() - last_time).total_seconds() / 3600
+                if hours_passed >= time_interval:
+                    time_ready = True
+                    logger.debug(
+                        f"[DiaryManager] {chat_type} 时间达标: {hours_passed:.1f}h/{time_interval}h"
+                    )
+        
+        # 根据trigger_type判断
+        if trigger_type == "message":
+            return message_ready
+        elif trigger_type == "time":
+            return time_ready
+        elif trigger_type == "both":
+            # AND逻辑：两者都满足
+            return message_ready and time_ready
+        elif trigger_type == "any":
+            # OR逻辑：任一满足
+            return message_ready or time_ready
+        else:
+            logger.warning(f"[DiaryManager] 未知的触发类型: {trigger_type}")
+            return False
+
+    async def trigger_summary(
+        self, conversation_id: str, identity: str, conversation_type: str = "group"
+    ) -> bool:
+        """
+        触发今天的增量总结生成（从数据库读取消息）
+        支持模型失败自动重试下一个模型
+
+        Args:
+            conversation_id: 对话ID
+            identity: bot的人设描述
+            conversation_type: 对话类型（"group" 或 "private"）
+
+        Returns:
+            bool: 是否成功生成总结
+        """
+        import time as time_module
+        from datetime import datetime
+        from src.chat.utils.chat_message_builder import get_raw_msg_by_timestamp_with_chat
+        from src.config.config import model_config
+        
+        # 获取模型列表，用于失败重试
+        if not model_config or not model_config.model_task_config:
+            logger.error("[DiaryManager] 模型配置未初始化")
+            return False
+        
+        model_set = model_config.model_task_config.replyer
+        model_list = model_set.model_list if hasattr(model_set, 'model_list') else [model_set]
+        
+        if not model_list:
+            logger.error("[DiaryManager] 没有可用的模型")
+            return False
+        
+        logger.info(f"[DiaryManager] 准备使用 {len(model_list)} 个模型进行总结，首选: {model_list[0] if model_list else 'None'}")
+        
+        async with self._get_lock(conversation_id):
+            conv_data = await self._load_conversation(conversation_id)
+            
+            # 从数据库获取自上次总结以来的所有消息
+            last_summary_time = conv_data.get("last_summary_time")
+            
+            if last_summary_time:
+                # 获取上次总结之后的消息
+                last_time = datetime.fromisoformat(last_summary_time).timestamp()
+                raw_messages = await get_raw_msg_by_timestamp_with_chat(
+                    chat_id=conversation_id,
+                    timestamp_start=last_time,
+                    timestamp_end=time_module.time(),
+                )
+            else:
+                # 首次总结：获取所有历史消息
+                from src.chat.utils.chat_message_builder import get_raw_msg_before_timestamp_with_chat
+                raw_messages = await get_raw_msg_before_timestamp_with_chat(
+                    chat_id=conversation_id,
+                    timestamp=time_module.time(),
+                    limit=1000,  # 最多1000条
+                )
+            
+            if not raw_messages:
+                logger.warning(f"[DiaryManager] 对话 {conversation_id[:16]}... 数据库中没有待处理消息，跳过总结")
+                return False
+            
+            # 转换为消息格式
+            messages = []
+            for msg in raw_messages:
+                messages.append({
+                    "time": datetime.fromtimestamp(msg.get("time", 0)).isoformat(),
+                    "sender": msg.get("user_nickname", "未知"),
+                    "content": msg.get("processed_plain_text", ""),
+                })
+            
+            logger.info(f"[DiaryManager] 从数据库读取到 {len(messages)} 条待总结消息")
+
+            # 尝试每个模型，直到成功
+            for model_index, current_model in enumerate(model_list, 1):
+                try:
+                    logger.info(f"[DiaryManager] 尝试模型 {model_index}/{len(model_list)}: {current_model}")
+                    
+                    from .diary_summarizer import DiarySummarizer
+
+                    summarizer = DiarySummarizer(self.config)
+                    pending_count = len(messages)
+
+            try:
+                # 估算所有消息的token数
+                all_messages_text = "\n".join(
+                    f"{m.get('sender', '')}: {m.get('content', '')}"
+                    for m in messages
+                )
+                estimated_tokens = self._estimate_tokens(all_messages_text)
+                
+                # 计算需要分几段（均匀分配）
+                segments_needed = self._calculate_even_segments(pending_count, estimated_tokens)
+                
+                if segments_needed > 1:
+                    # 需要分段总结
+                    items_per_segment = pending_count // segments_needed
+                    remainder = pending_count % segments_needed
+                    
+                    logger.info(
+                        f"[DiaryManager] 内容估算{estimated_tokens}tokens，超过{self.model_context_limit}tokens限制，"
+                        f"将均匀分{segments_needed}段总结（每段约{items_per_segment}条消息）"
+                    )
+                    
+                    segment_summaries = []
+                    start_idx = 0
+                    
+                    for i in range(segments_needed):
+                        # 均匀分配：前几段多分配余数
+                        segment_size = items_per_segment + (1 if i < remainder else 0)
+                        end_idx = start_idx + segment_size
+                        
+                        segment_msgs = messages[start_idx:end_idx]
+                        segment_summary = await summarizer.generate_summary(
+                            messages=segment_msgs,
+                            identity=identity,
+                            conversation_type=conversation_type,
+                        )
+                        segment_summaries.append(segment_summary["diary_content"])
+                        
+                        logger.debug(
+                            f"[DiaryManager] 完成第{i + 1}/{segments_needed}段总结，"
+                            f"消息数: {len(segment_msgs)}"
+                        )
+                        
+                        start_idx = end_idx
+                    
+                    # 合并多段总结
+                    merged_content = await summarizer.merge_segment_summaries(
+                        segment_summaries=segment_summaries,
+                        identity=identity,
+                        conversation_type=conversation_type,
+                        max_words=self.today_max_words,
+                    )
+                    
+                    # 构建最终总结对象
+                    summary = {
+                        "id": f"diary_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
+                        "start_time": messages[0]["time"],
+                        "end_time": messages[-1]["time"],
+                        "message_count": pending_count,
+                        "diary_content": merged_content,
+                        "created_at": datetime.now().isoformat(),
+                    }
+                else:
+                    # 直接总结
+                    summary = await summarizer.generate_summary(
+                        messages=messages,
+                        identity=identity,
+                        conversation_type=conversation_type,
+                    )
+
+                # 添加到今天的增量列表
+                conv_data["detailed_summaries"].append(summary)
+
+                # 更新元数据
+                conv_data["last_summary_time"] = datetime.now().isoformat()
+                conv_data["metadata"]["total_summaries"] += 1
+                conv_data["metadata"]["identity"] = identity  # 保存identity供日终总结使用
+                conv_data["metadata"]["updated_at"] = datetime.now().isoformat()
+
+                # 保存
+                await self._save_conversation(conversation_id, conv_data)
+
+                logger.info(
+                    f"[DiaryManager] ✅ 对话 {conversation_id[:16]}... 生成今天的增量总结成功，"
+                    f"消息数: {summary['message_count']}, "
+                    f"字数: {len(summary['diary_content'])}, "
+                    f"今天已有总结数: {len(conv_data['detailed_summaries'])}"
+                )
+                return True
+
+            except Exception as e:
+                logger.error(
+                    f"[DiaryManager] ❌ 生成今天增量总结失败 {conversation_id[:16]}...: {e}，"
+                    f"将尝试使用备用模型",
+                    exc_info=True
+                )
+                # 继续循环，尝试下一个模型
+                continue
+        
+        # 所有模型都失败
+        logger.error(f"[DiaryManager] ❌ 所有模型都无法生成总结，已尝试 {len(model_list)} 个模型")
+        return False
+
+    async def get_diary_for_prompt(self, conversation_id: str) -> str:
+        """
+        获取用于注入到提示词的日记内容（v3.0）
+        
+        Returns:
+            str: 格式化的日记文本，按"今天/昨天/前天"分层
+        """
+        async with self._get_lock(conversation_id):
+            try:
+                # 加载今天的数据
+                today_data = await self._load_conversation(conversation_id)
+                
+                diary_parts = []
+                
+                # 1. 今天的详细总结（多个增量）
+                detailed_summaries = today_data.get("detailed_summaries", [])
+                if detailed_summaries:
+                    today_contents = [
+                        s.get("diary_content", "")
+                        for s in detailed_summaries
+                        if isinstance(s, dict) and s.get("diary_content")
+                    ]
+                    if today_contents:
+                        today_text = "\n\n".join(today_contents)
+                        if len(today_text) > self.today_max_words:
+                            today_text = today_text[:self.today_max_words] + "..."
+                        diary_parts.append(f"【今天】\n{today_text}")
+                
+                # 2. 昨天的版本
+                yesterday_version = today_data.get("yesterday_version")
+                if yesterday_version:
+                    yesterday_text = str(yesterday_version)
+                    if len(yesterday_text) > self.yesterday_max_words:
+                        yesterday_text = yesterday_text[:self.yesterday_max_words] + "..."
+                    diary_parts.append(f"【昨天】\n{yesterday_text}")
+                
+                # 3. 前天的版本
+                older_version = today_data.get("older_version")
+                if older_version:
+                    older_text = str(older_version)
+                    if len(older_text) > self.older_max_words:
+                        older_text = older_text[:self.older_max_words] + "..."
+                    diary_parts.append(f"【前天】\n{older_text}")
+                
+                if not diary_parts:
+                    return ""
+                
+                return "\n\n---\n\n".join(diary_parts)
+                
+            except Exception as e:
+                logger.error(f"[DiaryManager] 获取日记内容失败: {e}", exc_info=True)
+                return ""
+                    if yesterday_text:
+                        # 截断到指定字数
+                        if len(yesterday_text) > self.yesterday_max_words:
+                            yesterday_text = yesterday_text[:self.yesterday_max_words] + "..."
+                        
+                        diary_parts.append(f"【昨天】\n{yesterday_text}")
+                except Exception as e:
+                    logger.error(f"[DiaryManager] 处理昨天的总结时出错: {e}")
+            
+            # 3. 前天的完整总结（单个）
+            older_summary = summaries.get("older")
+            if older_summary and isinstance(older_summary, dict):
+                try:
+                    older_text = older_summary.get("diary_content", "")
+                    if older_text:
+                        # 截断到指定字数
+                        if len(older_text) > self.older_max_words:
+                            older_text = older_text[:self.older_max_words] + "..."
+                        
+                        diary_parts.append(f"【前天】\n{older_text}")
+                except Exception as e:
+                    logger.error(f"[DiaryManager] 处理前天的总结时出错: {e}")
+
+            result = "\n\n".join(diary_parts) if diary_parts else ""
+            
+            if result:
+                logger.debug(
+                    f"[DiaryManager] 为prompt准备了日记内容: "
+                    f"今天{len(summaries.get('today', []))}段, "
+                    f"昨天{'有' if summaries.get('yesterday') else '无'}, "
+                    f"前天{'有' if summaries.get('older') else '无'}, "
+                    f"总字数: {len(result)}"
+                )
+            
+            return result
+
+    async def get_pending_count(self, conversation_id: str) -> int:
+        """获取待处理消息数（从数据库查询）"""
+        import time
+        from datetime import datetime
+        from src.chat.utils.chat_message_builder import (
+            get_raw_msg_before_timestamp_with_chat,
+            get_raw_msg_by_timestamp_with_chat,
+        )
+        
+        async with self._get_lock(conversation_id):
+            conv_data = await self._load_conversation(conversation_id)
+            last_summary_time = conv_data.get("last_summary_time")
+            
+            if not last_summary_time:
+                # 如果从未总结过，从数据库获取所有消息
+                messages = await get_raw_msg_before_timestamp_with_chat(
+                    chat_id=conversation_id,
+                    timestamp=time.time(),
+                    limit=1000,  # 最多获取1000条
+                )
+                return len(messages)
+            else:
+                # 获取最后一次总结时间之后的消息
+                last_time = datetime.fromisoformat(last_summary_time).timestamp()
+                messages = await get_raw_msg_by_timestamp_with_chat(
+                    chat_id=conversation_id,
+                    timestamp_start=last_time,
+                    timestamp_end=time.time(),
+                )
+                return len(messages)
+
+    async def clear_conversation(self, conversation_id: str):
+        """清空对话的所有数据"""
+        async with self._get_lock(conversation_id):
+            # 获取对话文件夹并删除所有文件
+            try:
+                folder = await self._get_conversation_folder(conversation_id)
+                if folder.exists():
+                    import shutil
+                    shutil.rmtree(folder)
+                    logger.info(f"[DiaryManager] 已清空对话 {conversation_id[:16]}... 的日记数据")
+            except Exception as e:
+                logger.error(f"[DiaryManager] 清空对话数据失败: {e}")

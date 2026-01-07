@@ -1,80 +1,92 @@
-# 连续日记式记忆插件 - 核心设计
+# 连续日记式记忆插件 - 设计文档
 
-## 🎯 核心逻辑：以零点为界的自然天
+## 🎯 核心设计：每天独立文件 + 统一生成逻辑
+
+### 设计原则
+1. **简单直接**：三个时间层（今天/昨天/前天）都用同一套逻辑生成
+2. **完全容错**：任何时候都能从数据库重新生成，不依赖历史状态
+3. **按需补全**：启动时 + 首次激活时检查，只对活跃对话补全
 
 ### 时间基准
-- **不是滚动24小时**，而是以**每天零点为界**
+- **以每天零点为界**，不是滚动24小时
 - **今天** = 今天零点到现在
 - **昨天** = 昨天零点到昨天23:59
 - **前天** = 前天零点到前天23:59
 
-### 总结类型
-
-#### 1. 今天：增量总结
-- **触发**：满足配置条件（消息数/时间）时触发
-- **次数**：一天内可能多次触发
-- **内容**：从零点到当前的所有消息
-- **存储**：保存在 `summaries["today"]` 列表中
-
-#### 2. 昨天：日终总结
-- **触发**：过零点后第一次add_message时自动触发
-- **次数**：一天只触发一次（零点后首次）
-- **内容**：整合昨天所有的增量总结，LLM重新整理为完整日记
-- **存储**：单个对象存在 `summaries["yesterday"]`
-
-#### 3. 前天：日终总结
-- **触发**：又过零点时，昨天的总结自动归档为前天
-- **次数**：自动归档，不需要LLM调用
-- **内容**：就是之前的"昨天"总结
-- **存储**：单个对象存在 `summaries["older"]`
+---
 
 ## 📊 数据结构
 
+### 文件组织
+```
+data/
+├── group/
+│   └── {群号}_{群名}/
+│       ├── 2026-01-05.json  # 前天
+│       ├── 2026-01-06.json  # 昨天
+│       └── 2026-01-07.json  # 今天
+└── private/
+    └── {用户ID}_{用户名}/
+        └── ...
+```
+
+### 单日数据结构
 ```json
 {
-  "conversation_id": "group_123456",
-  "pending_messages": [/* 待总结的消息 */],
-  "summaries": {
-    "today": [
-      {/* 今天的第1次增量总结 */},
-      {/* 今天的第2次增量总结 */},
-      {/* ... 可能多个 */}
-    ],
-    "yesterday": {/* 昨天的完整日终总结（单个）*/},
-    "older": {/* 前天的完整日终总结（单个）*/}
+  "date": "2026-01-07",
+  "summary": {
+    "content": "今天的日记内容...",
+    "message_count": 150,
+    "word_count": 1200,
+    "created_at": "2026-01-07T10:30:00",
+    "updated_at": "2026-01-07T18:45:00"
   },
-  "last_summary_time": "2026-01-06T10:30:00",
-  "last_summary_date": "2026-01-06",  // 关键：用于检测跨天
+  "last_summary_time": "2026-01-07T18:45:00",
   "metadata": {
-    "identity": "我是麦麦...",  // 保存人设供日终总结使用
-    "total_messages": 150,
-    "total_summaries": 5
+    "identity": "bot的人设信息...",
+    "chat_type": "group",
+    "stream_id": "..."
   }
 }
 ```
 
-## 🔄 跨天处理流程
+---
 
+## 🔄 核心流程
+
+### 总结生成（统一逻辑）
 ```
-每次 add_message() 时：
-  1. 检查 last_summary_date 是否是今天
-  
-  2. 如果不是今天（跨天了）：
-     a. older = yesterday  // 昨天的归档为前天
-     b. 整合今天的所有增量 → LLM调用 → yesterday
-     c. today = []  // 清空今天列表
-     d. last_summary_date = 今天日期
-  
-  3. 添加新消息到 pending_messages
-  
-  4. 检查是否满足今天的增量总结条件
-     - 群聊：group_trigger_type + threshold
-     - 私聊：private_trigger_type + threshold
-  
-  5. 如果满足：生成增量总结 → 添加到today列表
+generate_summary_for_date(conversation_id, target_date, identity, chat_type):
+  1. 检查该日期是否已有总结（非强制模式下跳过）
+  2. 计算时间范围：当天零点 → 23:59（或现在）
+  3. 从数据库读取该时间范围内的消息
+  4. 根据日期类型确定字数限制（今天/昨天/前天）
+  5. 调用 LLM 生成日记式总结
+  6. 保存到对应日期的 JSON 文件
 ```
 
-## ⚙️ 配置项（最终版）
+### 获取日记内容
+```
+get_diary_for_prompt(conversation_id):
+  1. 检查今天是否有总结（活跃标志）
+  2. 如果今天有总结 且 首次请求：
+     - 检查昨天/前天是否有总结
+     - 没有则自动补全
+  3. 读取三天的文件，拼接返回
+```
+
+### 启动检查
+```
+startup_completion_check():
+  1. 扫描所有对话目录
+  2. 筛选"今天有总结"的对话（活跃标志）
+  3. 对这些对话检查昨天/前天
+  4. 缺失的自动从数据库生成
+```
+
+---
+
+## ⚙️ 配置项
 
 ```toml
 [continuous_diary]
@@ -82,101 +94,70 @@ enable = true
 enabled_chat_types = ["group", "private"]
 
 # 群聊触发配置
-group_trigger_type = "both"  # time | message | both
+group_trigger_type = "any"       # time | message | both | any
 group_message_threshold = 50
 group_time_interval_hours = 6
 
 # 私聊触发配置
-private_trigger_type = "message"
+private_trigger_type = "any"
 private_message_threshold = 30
 private_time_interval_hours = 12
 
-# 字数限制（推荐比例 4:2:1）
-today_max_words = 2000      # 今天的增量总结最大字数
-yesterday_max_words = 1000  # 昨天的日终总结最大字数
-older_max_words = 500       # 前天的日终总结最大字数
+# 字数限制
+group_today_max_words = 2000
+group_yesterday_max_words = 1000
+group_older_max_words = 500
+private_today_max_words = 1500
+private_yesterday_max_words = 800
+private_older_max_words = 400
 
 # 存储配置
-retention_days = 3  # 保留天数（今天+昨天+前天=3）
+retention_days = 3
+model_context_limit_k = 100
 ```
 
-## 💾 存储位置
+---
 
-- **路径**：`{插件目录}/data/{conversation_id}.json`
-- **完整路径示例**：`Bot/src/plugins/built_in/continuous_diary/data/group_123456.json`
-- **特点**：
-  - ✅ 独立于主程序数据
-  - ✅ 不影响Bot的其他功能
-  - ✅ 方便备份和迁移
+## 🎨 命令系统
 
-## 🎨 Prompt注入
+| 命令 | 功能 |
+|------|------|
+| `/diary` | 显示三天日记状态 + 待处理消息数 |
+| `/diary refresh` | 强制刷新所有日记 |
 
-注入到以下prompt点：
-- `s4u_style_prompt`
-- `kfc_main`
-- `kfc_replyer`
-- `kfc_unified_prompt`
+---
 
-注入格式：
+## 📝 注入格式
+
 ```
+【你的日记回顾】
+（以下是你用自己的视角记录的最近对话经历）
+
 【今天】
-上午10点左右，小明问我...（最多2000字）
+上午10点多小明上线说代码跑不起来...
+
+---
 
 【昨天】
-昨天早上大家讨论了...（最多1000字）
+昨天早上大家讨论了...
+
+---
 
 【前天】
-前天聊到了周末计划...（最多500字）
+前天聊到了周末计划...
+
+---
+（以下是最近的原始对话）
 ```
 
-## 📝 LLM调用
+---
 
-### 1. 增量总结（今天）
-- **调用时机**：满足触发条件时
-- **输入**：pending_messages
-- **输出**：增量日记（约2000字）
-- **Prompt**：流水账式记录，带人设，第一人称
+## 🚀 优势
 
-### 2. 日终总结（昨天/前天）
-- **调用时机**：跨零点时
-- **输入**：今天所有增量总结的拼接
-- **输出**：完整的一天日记（约1000/500字）
-- **Prompt**：整合重组，突出重点，精简叙述
-
-## 🚀 性能优化
-
-- **并发安全**：asyncio.Lock 按 conversation_id 加锁
-- **自动清理**：跨天时自动删除超期数据
-- **懒加载**：只在需要时读取json文件
-- **成本控制**：用户可自由调整字数限制
-
-## 🔧 使用建议
-
-### 高频群聊
-```toml
-group_trigger_type = "both"  # 两个条件都满足才触发
-group_message_threshold = 100
-group_time_interval_hours = 12
-today_max_words = 3000
-```
-
-### 低频私聊
-```toml
-private_trigger_type = "message"  # 只按消息数
-private_message_threshold = 20
-today_max_words = 1500
-```
-
-### 成本敏感
-```toml
-today_max_words = 1000
-yesterday_max_words = 500
-older_max_words = 200
-```
-
-### 质量优先
-```toml
-today_max_words = 4000
-yesterday_max_words = 2000
-older_max_words = 1000
-```
+| 特性 | 说明 |
+|------|------|
+| **统一逻辑** | 三个时间层用同一套代码，好维护 |
+| **完全容错** | 任何时候都能从数据库重新生成 |
+| **按需补全** | 只对活跃对话补全，不浪费资源 |
+| **简单结构** | 每天一个文件，清晰明了 |
+| **无状态依赖** | 不依赖"增量合并"，断电也不怕 |

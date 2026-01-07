@@ -18,17 +18,13 @@ class DiarySummarizer:
         self.group_today_max_words = config.get("group_today_max_words", 2000)
         self.private_today_max_words = config.get("private_today_max_words", 1500)
 
-    def _calculate_time_based_word_limit(self, conversation_type: str) -> tuple[int, str]:
+    def _calculate_time_based_word_limit(self, base_words: int) -> tuple[int, str]:
         """
-        根据当前时间段计算字数限制（使用系统本地时区时间）
+        根据当前时间段动态调整字数限制
         
         Returns:
             tuple[int, str]: (字数限制, 时间段描述)
         """
-        from datetime import datetime
-        
-        base_words = self.group_today_max_words if conversation_type == "group" else self.private_today_max_words
-        # 使用本地时区的当前时间（不是UTC）
         current_hour = datetime.now().hour
         
         if current_hour < 8:
@@ -45,7 +41,12 @@ class DiarySummarizer:
         return word_limit, period
 
     async def generate_summary(
-        self, messages: list[dict], identity: str, conversation_type: str
+        self,
+        messages: list[dict],
+        identity: str,
+        conversation_type: str,
+        target_max_words: int | None = None,
+        date_type: str = "today"
     ) -> dict:
         """
         生成日记式总结
@@ -54,30 +55,41 @@ class DiarySummarizer:
             messages: 消息列表
             identity: bot的人设描述
             conversation_type: 对话类型（"group" 或 "private"）
+            target_max_words: 目标字数上限（如果不提供则根据时间动态计算）
+            date_type: 日期类型 "today" | "yesterday" | "older"
 
         Returns:
             dict: 总结对象
         """
-        # 根据时间段计算字数限制
-        max_words, period = self._calculate_time_based_word_limit(conversation_type)
+        # 确定字数限制
+        if target_max_words:
+            # 只有今天才应用时间段动态调整
+            if date_type == "today":
+                max_words, period = self._calculate_time_based_word_limit(target_max_words)
+            else:
+                max_words = target_max_words
+                period = "历史"
+        else:
+            base_words = self.group_today_max_words if conversation_type == "group" else self.private_today_max_words
+            max_words, period = self._calculate_time_based_word_limit(base_words)
         
-        # 1. 构建消息文本
+        # 构建消息文本
         messages_text = self._format_messages(messages)
 
-        # 2. 构建prompt（传入时间段和字数信息）
+        # 构建prompt
         prompt = self._build_summary_prompt(
             messages_text=messages_text,
             identity=identity,
             conversation_type=conversation_type,
             max_words=max_words,
             period=period,
+            message_count=len(messages),
         )
 
-        # 3. 调用LLM（使用主回复模型）
+        # 调用LLM
         from src.config.config import model_config
         from src.llm_models.utils_model import LLMRequest
 
-        # 获取主回复模型配置
         if not model_config or not model_config.model_task_config:
             raise ValueError("模型配置未初始化")
         
@@ -90,99 +102,100 @@ class DiarySummarizer:
 
         logger.debug(
             f"[DiarySummarizer] 调用LLM生成总结，消息数={len(messages)}, "
-            f"时间段={period}, 目标字数={max_words}, max_tokens={max_tokens}"
+            f"时间段={period}, 目标字数={max_words}"
         )
 
         result = await llm.generate_response_async(
             prompt, temperature=0.3, max_tokens=max_tokens
         )
         
-        # 解包返回值（可能是tuple[str, tuple] 或其他格式）
+        # 解包返回值
         if isinstance(result, tuple) and len(result) >= 1:
             summary_text = result[0]
         else:
             summary_text = str(result)
 
-        # 5. 返回总结对象
         return {
             "id": f"diary_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
-            "start_time": messages[0]["time"],
-            "end_time": messages[-1]["time"],
+            "start_time": messages[0]["time"] if messages else "",
+            "end_time": messages[-1]["time"] if messages else "",
             "message_count": len(messages),
             "diary_content": summary_text.strip(),
             "created_at": datetime.now().isoformat(),
         }
 
     def _build_summary_prompt(
-        self, messages_text: str, identity: str, conversation_type: str, max_words: int, period: str
+        self,
+        messages_text: str,
+        identity: str,
+        conversation_type: str,
+        max_words: int,
+        period: str,
+        message_count: int
     ) -> str:
-        """构建总结prompt（主观视角，带人设）"""
-
+        """构建总结prompt"""
         scene = "群聊" if conversation_type == "group" else "私聊"
         scene_desc = "群里和大家" if conversation_type == "group" else "和对方"
         
-        # 根据时间段给出不同的提示
+        # 时间段提示
         if period == "早上":
-            time_hint = f"现在是{period}，今天刚开始，记录一下早上发生的事就好，不用写结尾总结。"
+            time_hint = f"现在是{period}，今天刚开始。"
         elif period == "中午":
-            time_hint = f"现在是{period}，今天已经过了一半，继续记录中午的事情，还没到一天结束，不用写结尾总结。"
-        else:  # 晚上
-            time_hint = f"现在是{period}，一天快结束了，可以完整回顾今天发生的所有事情，可以写个简单的收尾感想。"
-        
-        # 准备示例文本（避免f-string嵌套问题）
-        if conversation_type == "group":
-            example = """群聊记忆片段示例：
-上午10点多小明上线说代码跑不起来，看着挺急的。有人建议检查接口参数，小红也说可以试试XX工具。几个人一起帮忙，讨论了20多分钟，小明说搞定了。
-
-中午12点半群里聊起午饭，小李说点了麻辣烫，听着就香。大家都开始说自己吃的，还推荐了好几家店，挺热闹的。
-
-下午2点多小王说周末去爬山，讨论了时间和地点，最后定周六早上8点集合。"""
+            time_hint = f"现在是{period}，今天过了一半。"
+        elif period == "历史":
+            time_hint = "这是历史记忆的整理。"
         else:
-            example = """私聊记忆片段示例：
-上午10点多小明发消息说最近工作压力大，讲了一会儿项目的事，确实挺累的。跟他分享了些应对办法，他说会试试。
+            time_hint = f"现在是{period}，一天快结束了。"
 
-中午他发了几张午饭照片，做得不错。夸了夸他的厨艺，他说是跟着B站学的。聊了会儿做饭的事，挺有意思。
-
-下午3点多他问周末有没有空一起出去玩。讨论了几个地方，最后定周六去爬山，他看起来挺期待的。"""
-
-        return f"""你需要用第一人称（"我"）整理今天在{scene}里发生的事情，作为自己的记忆片段保存起来，方便以后回想。这不是在写文学作品，就是像自己在脑海里过一遍今天发生了什么，用自然的、口语化的方式记下来。
+        return f"""用第一人称（"我"）整理在{scene}里发生的事情，作为自己的记忆片段。这些记忆之后会帮助你回忆起这段时间发生了什么。
 
 ## 你是谁
 {identity}
 
-## 今天{scene_desc}的对话记录
+## {scene_desc}的对话记录（共{message_count}条消息）
 {messages_text}
 
 ---
 
-整理记忆时的要求：
+## 整理原则（重要！）
 
-1. 用你平时说话的方式来记录，自然、简洁、口语化，不要写成文学作品或正式文章
-2. 按时间顺序记下发生了什么，谁说了什么，你当时怎么想的
-3. 完全符合你的人设和表达方式——你会关注什么？会怎么看这些事？用什么样的语气？
-4. 这是真实的个人经历记录，你不是虚拟AI，你是真实的人
-5. 避免过度文学化的描写和修辞，就像脑海里自然回忆一样
+**核心目标：信息完整性 > 字数控制**
 
-**重要：时间段和字数**
+1. **必须记录的内容**（不能遗漏）：
+   - 讨论的主要话题和结论
+   - 重要的事件、决定、约定
+   - 有意义的对话内容和观点
+   - 涉及到的人名和他们说了什么重要的话
+   - 时间节点（大概几点发生的事）
+
+2. **可以省略的内容**：
+   - 重复的寒暄和水话
+   - 表情包、无意义的回复
+   - 完全相同话题的重复讨论
+
+3. **格式要求**：
+   - 自然、口语化，像脑海里回想
+   - 按时间顺序组织
+   - 符合你的人设和表达方式
+
+## 字数说明
 {time_hint}
-目标字数大约{max_words}字，分几段记录即可。
+- 字数上限：{max_words}字
+- **原则：宁可多写确保完整，也不要为了省字数丢失信息**
+- 如果对话内容确实很少，那就简短写；如果内容丰富，就详细写
+- 不要刻意凑字数，但也不要刻意省略重要信息
 
-参考这种记忆片段的风格：
-
-{example}
-
-现在，用符合你人设的方式整理记忆：
+现在开始整理记忆：
 """
 
     def _format_messages(self, messages: list[dict]) -> str:
-        """格式化消息为文本（始终包含时间戳）"""
+        """格式化消息为文本"""
         lines = []
         for msg in messages:
             time_str = msg.get("time", "")
             sender = msg.get("sender", "未知")
             content = msg.get("content", "")
 
-            # 格式化时间
             if time_str:
                 try:
                     dt = datetime.fromisoformat(time_str)
@@ -195,52 +208,52 @@ class DiarySummarizer:
 
         return "\n".join(lines)
 
-    async def consolidate_daily_summary(
+    async def compress_summary(
         self,
-        daily_content: str,
-        date: str,
+        original_content: str,
+        target_words: int,
         identity: str,
-        conversation_type: str,
-        max_words: int,
-    ) -> dict:
+        version_type: str = "yesterday"
+    ) -> str:
         """
-        整合一天的多个增量总结为完整的日终总结
+        压缩总结到目标字数
 
         Args:
-            daily_content: 今天所有增量总结的内容（已拼接）
-            date: 日期字符串（YYYY-MM-DD）
+            original_content: 原始总结内容
+            target_words: 目标字数
             identity: bot的人设描述
-            conversation_type: 对话类型
-            max_words: 目标字数（昨天或前天的字数限制）
+            version_type: "yesterday" 或 "older"
 
         Returns:
-            dict: 日终总结对象
+            str: 压缩后的内容
         """
-        scene = "群聊" if conversation_type == "group" else "私聊"
+        if version_type == "yesterday":
+            version_desc = "昨天的记忆"
+            hint = "保留主要事件和关键对话，去除细节"
+        else:
+            version_desc = "前天的记忆"
+            hint = "只保留最重要的事，高度概括"
 
-        prompt = f"""把今天的多段记忆片段整合成一份完整的记忆。
+        prompt = f"""请将这段日记记忆压缩到{target_words}字左右。
 
-## 你是谁
+## 你的身份
 {identity}
 
-## 基本信息
-- 日期：{date}
-- 场景：{scene}
-
-## 今天的多段记忆
-{daily_content}
+## 原始记忆（{len(original_content)}字）
+{original_content}
 
 ---
 
-整合要求：
+## 压缩要求
+这是{version_desc}，需要{hint}。
 
-1. 用第一人称（"我"），口语化、自然的方式记录
-2. 合并重复部分，保留最重要的事，按时间顺序（上午→中午→下午→晚上）组织
-3. 完全符合你的人设和表达方式，不要写成文学作品
-4. 这是真实的个人记忆，你不是虚拟AI，你是真实的人
-5. 因为是{"昨天" if max_words == 800 else "前天"}的记忆，精简到大概{max_words}字左右
+1. 保持第一人称（"我"）
+2. 保留重要的人名、事件、结论
+3. 去除细节描写和冗余表达
+4. 保持你的表达风格
+5. 目标字数：{target_words}字左右
 
-开始整理：
+开始压缩：
 """
 
         from src.config.config import model_config
@@ -251,31 +264,23 @@ class DiarySummarizer:
 
         llm = LLMRequest(
             model_set=model_config.model_task_config.replyer,
-            request_type="continuous_diary_consolidate",
+            request_type="continuous_diary_compress",
         )
 
-        max_tokens = int(max_words * 2.5)
+        max_tokens = int(target_words * 2.5)
 
-        logger.debug(
-            f"[DiarySummarizer] 整合日终总结，日期={date}, 目标字数={max_words}"
-        )
+        logger.debug(f"[DiarySummarizer] 压缩总结，原{len(original_content)}字 → 目标{target_words}字")
 
         result = await llm.generate_response_async(
             prompt, temperature=0.3, max_tokens=max_tokens
         )
 
         if isinstance(result, tuple) and len(result) >= 1:
-            summary_text = result[0]
+            compressed_text = result[0]
         else:
-            summary_text = str(result)
+            compressed_text = str(result)
 
-        # 返回日终总结对象
-        return {
-            "id": f"daily_{date}",
-            "date": date,
-            "diary_content": summary_text.strip(),
-            "created_at": datetime.now().isoformat(),
-        }
+        return compressed_text.strip()
 
     async def merge_segment_summaries(
         self,
@@ -285,7 +290,7 @@ class DiarySummarizer:
         max_words: int,
     ) -> str:
         """
-        合并多段总结为一个完整总结（用于防止单次消息过多爆上下文）
+        合并多段总结为一个完整总结
 
         Args:
             segment_summaries: 多段总结的列表
@@ -298,12 +303,11 @@ class DiarySummarizer:
         """
         scene = "群聊" if conversation_type == "group" else "私聊"
         
-        # 拼接多段内容
         all_content = "\n\n---\n\n".join(segment_summaries)
 
-        prompt = f"""刚才分了{len(segment_summaries)}段记录记忆，现在需要把这些片段整合成完整的记忆。
+        prompt = f"""把这{len(segment_summaries)}段记忆片段整合成完整的记忆。
 
-## 你的身份和性格
+## 你的身份
 {identity}
 
 ## 场景
@@ -314,13 +318,12 @@ class DiarySummarizer:
 
 ---
 
-把这几段合并成连贯的记忆片段。检查有没有重复内容，调整段落衔接，让整体更流畅。
+合并要求：
+1. 检查有没有重复内容，调整段落衔接
+2. 保持你的人设和表达方式
+3. 大概{max_words}字左右
 
-重要：合并时要完全符合你的人设，用你的视角和表达方式来组织这些记忆。第三人称客观描述事实，但要融入你基于人设的理解和感受。
-
-大概{max_words}字左右。
-
-开始整理：
+开始整合：
 """
 
         from src.config.config import model_config
@@ -336,9 +339,7 @@ class DiarySummarizer:
 
         max_tokens = int(max_words * 2.5)
 
-        logger.debug(
-            f"[DiarySummarizer] 合并{len(segment_summaries)}段总结，目标字数={max_words}"
-        )
+        logger.debug(f"[DiarySummarizer] 合并{len(segment_summaries)}段总结，目标字数={max_words}")
 
         result = await llm.generate_response_async(
             prompt, temperature=0.3, max_tokens=max_tokens

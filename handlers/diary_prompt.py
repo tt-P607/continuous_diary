@@ -55,28 +55,21 @@ class DiaryPromptComponent(BasePrompt):
         ),
     ]
 
-    manager: ClassVar["DiaryManager | None"] = None  # 从插件注入
+    manager: ClassVar["DiaryManager | None"] = None
 
     def __init__(self, params, plugin_config: dict, target_prompt_name: str | None = None):
         super().__init__(params, plugin_config, target_prompt_name)
 
     async def execute(self) -> str:
         """执行提示词生成"""
-        
-        logger.info("[DiaryPrompt] execute() 被调用")
-
         # 获取stream_id和类型
         stream_id, chat_type = await self._extract_stream_info()
         if not stream_id:
-            logger.info("[DiaryPrompt] 无法获取stream_id，跳过注入")
             return ""
         
-        logger.info(f"[DiaryPrompt] stream_id={stream_id[:16]}..., chat_type={chat_type}")
-
         # 检查是否在适用范围内
         enabled_types = self.get_config("enabled_chat_types", ["group", "private"])
         if chat_type not in enabled_types:
-            logger.info(f"[DiaryPrompt] 对话类型 {chat_type} 不在适用范围内（enabled={enabled_types}）")
             return ""
 
         # 获取日记内容
@@ -84,22 +77,26 @@ class DiaryPromptComponent(BasePrompt):
             logger.warning("[DiaryPrompt] DiaryManager 未初始化")
             return ""
 
-        diary_content = await self.manager.get_diary_for_prompt(stream_id)
-
-        if not diary_content:
-            logger.info(f"[DiaryPrompt] 对话 {stream_id[:16]}... 暂无日记内容")
+        try:
+            diary_content = await self.manager.get_diary_for_prompt(stream_id)
+        except Exception as e:
+            logger.error(f"[DiaryPrompt] 获取日记内容失败: {e}")
             return ""
 
-        # 格式化输出（简洁版）
+        if not diary_content:
+            return ""
+
+        # 格式化输出
         result = f"""
 【你的日记回顾】
-（以下是你用自己的视角记录的近24小时内的经历）
+（以下是你用自己的视角记录的最近对话经历）
 
 {diary_content}
 
 ---
 （以下是最近的原始对话）
 """
+        logger.debug(f"[DiaryPrompt] 注入日记内容 {len(diary_content)} 字")
         return result
 
     async def _extract_stream_info(self) -> tuple[str | None, str]:
@@ -109,7 +106,6 @@ class DiaryPromptComponent(BasePrompt):
         if not params:
             return None, "unknown"
 
-        # 从PromptParameters中获取chat_id和is_group_chat
         chat_id = getattr(params, "chat_id", None) or ""
         is_group_chat = getattr(params, "is_group_chat", False)
         

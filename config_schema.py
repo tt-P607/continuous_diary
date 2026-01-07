@@ -140,6 +140,14 @@ CONFIG_SCHEMA = {
             min=10,
             max=1000,
         ),
+        
+        # 模型配置
+        "model_name": ConfigField(
+            type=str,
+            default="",
+            description="用于生成日记的模型名称（留空则使用默认回复模型）。模型必须在 model_config.toml 中已定义。支持多个模型用逗号分隔，会按顺序尝试并自动重试",
+            label="模型名称",
+        ),
     },
 }
 

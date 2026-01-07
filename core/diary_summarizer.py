@@ -1,6 +1,7 @@
 """
 日记总结生成器 - LLM调用模块
 负责调用LLM生成主观视角的日记式总结
+支持配置模型和顺延重试
 """
 
 from datetime import datetime
@@ -17,6 +18,19 @@ class DiarySummarizer:
         self.config = config
         self.group_today_max_words = config.get("group_today_max_words", 2000)
         self.private_today_max_words = config.get("private_today_max_words", 1500)
+        
+        # 模型配置（模型名称必须在 model_config.toml 中已定义）
+        model_name_config = config.get("model_name", "")
+        
+        # 解析多个模型（逗号分隔）
+        if model_name_config:
+            self.model_list = [m.strip() for m in model_name_config.split(",") if m.strip()]
+        else:
+            self.model_list = []
+        
+        # 缓存的 TaskConfig（延迟初始化）
+        self._custom_task_config = None
+        self._task_config_initialized = False
 
     def _calculate_time_based_word_limit(self, base_words: int) -> tuple[int, str]:
         """
@@ -86,34 +100,17 @@ class DiarySummarizer:
             message_count=len(messages),
         )
 
-        # 调用LLM
-        from src.config.config import model_config
-        from src.llm_models.utils_model import LLMRequest
-
-        if not model_config or not model_config.model_task_config:
-            raise ValueError("模型配置未初始化")
-        
-        llm = LLMRequest(
-            model_set=model_config.model_task_config.replyer,
-            request_type="continuous_diary_summary",
-        )
-
+        # 调用LLM（支持顺延重试）
         max_tokens = int(max_words * 2.5)
-
-        logger.debug(
-            f"[DiarySummarizer] 调用LLM生成总结，消息数={len(messages)}, "
-            f"时间段={period}, 目标字数={max_words}"
-        )
-
-        result = await llm.generate_response_async(
-            prompt, temperature=0.3, max_tokens=max_tokens
+        
+        summary_text = await self._call_llm_with_retry(
+            prompt=prompt,
+            max_tokens=max_tokens,
+            request_type="continuous_diary_summary"
         )
         
-        # 解包返回值
-        if isinstance(result, tuple) and len(result) >= 1:
-            summary_text = result[0]
-        else:
-            summary_text = str(result)
+        if not summary_text:
+            raise ValueError("LLM 调用失败，所有模型都返回空结果")
 
         return {
             "id": f"diary_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
@@ -208,6 +205,133 @@ class DiarySummarizer:
 
         return "\n".join(lines)
 
+    def _get_custom_task_config(self):
+        """
+        获取自定义的 TaskConfig（延迟初始化）
+        
+        检查配置的模型是否在 model_config 中存在，如果存在则创建 TaskConfig
+        """
+        if self._task_config_initialized:
+            return self._custom_task_config
+        
+        self._task_config_initialized = True
+        
+        if not self.model_list:
+            return None
+        
+        try:
+            from src.config.api_ada_configs import TaskConfig
+            from src.config.config import model_config
+            
+            if not model_config:
+                logger.warning("[DiarySummarizer] model_config 未初始化，无法使用自定义模型")
+                return None
+            
+            # 验证所有配置的模型都存在于 model_config 中
+            valid_models = []
+            for model_name in self.model_list:
+                try:
+                    model_config.get_model_info(model_name)
+                    valid_models.append(model_name)
+                except KeyError:
+                    logger.warning(f"[DiarySummarizer] 模型 '{model_name}' 未在 model_config.toml 中定义，跳过")
+            
+            if not valid_models:
+                logger.warning("[DiarySummarizer] 没有有效的自定义模型，将使用默认模型")
+                return None
+            
+            # 创建 TaskConfig
+            self._custom_task_config = TaskConfig(
+                model_list=valid_models,
+                max_tokens=5000,  # 足够长的输出
+                temperature=0.3,
+                concurrency_count=1,
+            )
+            
+            logger.info(f"[DiarySummarizer] 使用自定义模型: {valid_models}")
+            return self._custom_task_config
+            
+        except Exception as e:
+            logger.error(f"[DiarySummarizer] 创建自定义 TaskConfig 失败: {e}")
+            return None
+
+    async def _call_llm_with_retry(
+        self,
+        prompt: str,
+        max_tokens: int,
+        request_type: str
+    ) -> str:
+        """
+        调用LLM，支持配置模型和顺延重试
+        
+        优先使用配置的模型列表，失败后回退到默认模型
+        模型名称必须在 model_config.toml 中已定义
+        """
+        from src.llm_models.utils_model import LLMRequest
+        
+        errors = []
+        
+        # 1. 先尝试配置的自定义模型列表
+        custom_task_config = self._get_custom_task_config()
+        if custom_task_config:
+            try:
+                logger.debug(f"[DiarySummarizer] 尝试自定义模型: {custom_task_config.model_list}")
+                
+                llm = LLMRequest(
+                    model_set=custom_task_config,
+                    request_type=request_type,
+                )
+                
+                result = await llm.generate_response_async(
+                    prompt, temperature=0.3, max_tokens=max_tokens
+                )
+                
+                if isinstance(result, tuple) and len(result) >= 1:
+                    text = result[0]
+                else:
+                    text = str(result)
+                
+                if text and text.strip():
+                    logger.info(f"[DiarySummarizer] 自定义模型调用成功")
+                    return text.strip()
+                    
+            except Exception as e:
+                errors.append(f"自定义模型: {e}")
+                logger.warning(f"[DiarySummarizer] 自定义模型失败: {e}")
+        
+        # 2. 回退到默认模型
+        try:
+            from src.config.config import model_config
+            
+            if model_config and model_config.model_task_config:
+                logger.debug("[DiarySummarizer] 回退到默认回复模型")
+                
+                llm = LLMRequest(
+                    model_set=model_config.model_task_config.replyer,
+                    request_type=request_type,
+                )
+                
+                result = await llm.generate_response_async(
+                    prompt, temperature=0.3, max_tokens=max_tokens
+                )
+                
+                if isinstance(result, tuple) and len(result) >= 1:
+                    text = result[0]
+                else:
+                    text = str(result)
+                
+                if text and text.strip():
+                    logger.info("[DiarySummarizer] 默认模型调用成功")
+                    return text.strip()
+                    
+        except Exception as e:
+            errors.append(f"默认模型: {e}")
+            logger.error(f"[DiarySummarizer] 默认模型也失败: {e}")
+        
+        # 全部失败
+        logger.error(f"[DiarySummarizer] 所有模型都失败: {errors}")
+        return ""
+
     async def compress_summary(
         self,
         original_content: str,
@@ -215,18 +339,7 @@ class DiarySummarizer:
         identity: str,
         version_type: str = "yesterday"
     ) -> str:
-        """
-        压缩总结到目标字数
-
-        Args:
-            original_content: 原始总结内容
-            target_words: 目标字数
-            identity: bot的人设描述
-            version_type: "yesterday" 或 "older"
-
-        Returns:
-            str: 压缩后的内容
-        """
+        """压缩总结到目标字数"""
         if version_type == "yesterday":
             version_desc = "昨天的记忆"
             hint = "保留主要事件和关键对话，去除细节"
@@ -256,31 +369,16 @@ class DiarySummarizer:
 开始压缩：
 """
 
-        from src.config.config import model_config
-        from src.llm_models.utils_model import LLMRequest
-
-        if not model_config or not model_config.model_task_config:
-            raise ValueError("模型配置未初始化")
-
-        llm = LLMRequest(
-            model_set=model_config.model_task_config.replyer,
-            request_type="continuous_diary_compress",
-        )
-
         max_tokens = int(target_words * 2.5)
-
         logger.debug(f"[DiarySummarizer] 压缩总结，原{len(original_content)}字 → 目标{target_words}字")
-
-        result = await llm.generate_response_async(
-            prompt, temperature=0.3, max_tokens=max_tokens
+        
+        result = await self._call_llm_with_retry(
+            prompt=prompt,
+            max_tokens=max_tokens,
+            request_type="continuous_diary_compress"
         )
-
-        if isinstance(result, tuple) and len(result) >= 1:
-            compressed_text = result[0]
-        else:
-            compressed_text = str(result)
-
-        return compressed_text.strip()
+        
+        return result
 
     async def merge_segment_summaries(
         self,
@@ -289,20 +387,8 @@ class DiarySummarizer:
         conversation_type: str,
         max_words: int,
     ) -> str:
-        """
-        合并多段总结为一个完整总结
-
-        Args:
-            segment_summaries: 多段总结的列表
-            identity: bot的人设描述
-            conversation_type: 对话类型
-            max_words: 目标字数
-
-        Returns:
-            str: 合并后的总结内容
-        """
+        """合并多段总结为一个完整总结"""
         scene = "群聊" if conversation_type == "group" else "私聊"
-        
         all_content = "\n\n---\n\n".join(segment_summaries)
 
         prompt = f"""把这{len(segment_summaries)}段记忆片段整合成完整的记忆。
@@ -326,28 +412,13 @@ class DiarySummarizer:
 开始整合：
 """
 
-        from src.config.config import model_config
-        from src.llm_models.utils_model import LLMRequest
-
-        if not model_config or not model_config.model_task_config:
-            raise ValueError("模型配置未初始化")
-
-        llm = LLMRequest(
-            model_set=model_config.model_task_config.replyer,
-            request_type="continuous_diary_merge",
-        )
-
         max_tokens = int(max_words * 2.5)
-
         logger.debug(f"[DiarySummarizer] 合并{len(segment_summaries)}段总结，目标字数={max_words}")
-
-        result = await llm.generate_response_async(
-            prompt, temperature=0.3, max_tokens=max_tokens
+        
+        result = await self._call_llm_with_retry(
+            prompt=prompt,
+            max_tokens=max_tokens,
+            request_type="continuous_diary_merge"
         )
-
-        if isinstance(result, tuple) and len(result) >= 1:
-            merged_text = result[0]
-        else:
-            merged_text = str(result)
-
-        return merged_text.strip()
+        
+        return result

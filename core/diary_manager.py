@@ -65,6 +65,12 @@ class DiaryManager:
 
     # ==================== 路径管理 ====================
     
+    def _sanitize_folder_name(self, name: str) -> str:
+        """清理文件夹名称中的非法字符"""
+        for char in r'<>:"/\\|?*':
+            name = name.replace(char, "_")
+        return name[:50]
+    
     async def _get_conversation_info(self, stream_id: str) -> tuple[str, str, str]:
         try:
             from src.chat.message_receive.chat_stream import get_chat_manager
@@ -85,21 +91,74 @@ class DiaryManager:
             else:
                 return "unknown", stream_id[:16], "未知对话"
             
-            # 清理文件名
-            for char in r'<>:"/\\|?*':
-                object_name = object_name.replace(char, "_")
-            object_name = object_name[:50]
-            
+            object_name = self._sanitize_folder_name(object_name)
             return chat_type, object_id, object_name
         except Exception as e:
             logger.error(f"[DiaryManager] 获取对话信息失败: {e}")
             return "unknown", stream_id[:16], "未知对话"
 
+    def _find_folder_by_id(self, type_dir: Path, object_id: str) -> Path | None:
+        """
+        按 ID 前缀查找已存在的文件夹
+        文件夹格式: {object_id}_{object_name}
+        """
+        if not type_dir.exists():
+            return None
+        
+        prefix = f"{object_id}_"
+        matching = [d for d in type_dir.iterdir() if d.is_dir() and d.name.startswith(prefix)]
+        
+        if len(matching) == 1:
+            return matching[0]
+        elif len(matching) > 1:
+            # 多个匹配（不应该发生），返回最新修改的
+            logger.warning(f"[DiaryManager] 发现多个匹配文件夹: {[d.name for d in matching]}，使用最新的")
+            return max(matching, key=lambda d: d.stat().st_mtime)
+        return None
+
     async def _get_conversation_folder(self, stream_id: str) -> Path:
+        """
+        获取对话数据文件夹，支持按 ID 锚定和自动重命名
+        
+        逻辑:
+        1. 获取当前对话信息（chat_type, object_id, object_name）
+        2. 在对应类型目录下按 ID 前缀查找已存在的文件夹
+        3. 如果找到但名称不同，安全重命名为新名称
+        4. 如果未找到，创建新文件夹
+        """
         chat_type, object_id, object_name = await self._get_conversation_info(stream_id)
-        folder = self.data_dir / chat_type / f"{object_id}_{object_name}"
-        folder.mkdir(parents=True, exist_ok=True)
-        return folder
+        type_dir = self.data_dir / chat_type
+        type_dir.mkdir(parents=True, exist_ok=True)
+        
+        expected_name = f"{object_id}_{object_name}"
+        expected_path = type_dir / expected_name
+        
+        # 查找已存在的文件夹
+        existing_folder = self._find_folder_by_id(type_dir, object_id)
+        
+        if existing_folder:
+            if existing_folder.name != expected_name:
+                # 名称变化，需要重命名
+                try:
+                    # 确保目标不存在
+                    if expected_path.exists():
+                        logger.warning(f"[DiaryManager] 目标文件夹已存在，跳过重命名: {expected_path}")
+                        return expected_path
+                    
+                    # 安全重命名
+                    existing_folder.rename(expected_path)
+                    logger.info(f"[DiaryManager] 文件夹重命名: {existing_folder.name} → {expected_name}")
+                    return expected_path
+                except Exception as e:
+                    logger.error(f"[DiaryManager] 重命名失败，使用原文件夹: {e}")
+                    return existing_folder
+            else:
+                # 名称相同，直接返回
+                return existing_folder
+        else:
+            # 未找到，创建新文件夹
+            expected_path.mkdir(parents=True, exist_ok=True)
+            return expected_path
     
     async def _get_date_file(self, stream_id: str, date: str) -> Path:
         folder = await self._get_conversation_folder(stream_id)
@@ -388,6 +447,28 @@ class DiaryManager:
 
     # ==================== 启动检查 ====================
     
+    def _read_file_directly(self, file_path: Path) -> dict | None:
+        """直接读取文件，不经过动态路径查找"""
+        if not file_path.exists():
+            return None
+        try:
+            with open(file_path, encoding="utf-8") as f:
+                return json.load(f)
+        except:
+            return None
+    
+    def _has_version_content(self, data: dict | None, version_key: str) -> bool:
+        """检查数据中是否有指定版本的内容"""
+        if not data:
+            return False
+        # 检查新格式
+        if data.get(version_key, {}).get("content"):
+            return True
+        # 兼容旧格式
+        if version_key == "today_version" and data.get("summary", {}).get("content"):
+            return True
+        return False
+    
     async def startup_completion_check(self):
         async with self._global_lock:
             today = datetime.now().strftime("%Y-%m-%d")
@@ -395,6 +476,8 @@ class DiaryManager:
             day_before = (datetime.now() - timedelta(days=2)).strftime("%Y-%m-%d")
             
             count = 0
+            skipped = 0
+            generated = 0
             logger.info("[DiaryManager] 开始启动检查...")
             
             for chat_type_name in ["group", "private"]:
@@ -411,15 +494,16 @@ class DiaryManager:
                         continue
                     
                     try:
-                        with open(today_file, encoding="utf-8") as f:
-                            data = json.load(f)
+                        today_data = self._read_file_directly(today_file)
+                        if not today_data:
+                            continue
                         
                         # 检查是否有内容
-                        has_content = data.get("today_version", {}).get("content") or data.get("summary", {}).get("content")
+                        has_content = self._has_version_content(today_data, "today_version")
                         if not has_content:
                             continue
                         
-                        metadata = data.get("metadata", {})
+                        metadata = today_data.get("metadata", {})
                         identity = metadata.get("identity", "")
                         chat_type = metadata.get("chat_type", chat_type_name)
                         stream_id = metadata.get("stream_id", "")
@@ -429,20 +513,39 @@ class DiaryManager:
                         
                         count += 1
                         
-                        # 生成昨天的 yesterday_version
-                        if (conv_dir / f"{yesterday}.json").exists():
-                            await self.generate_version(stream_id, yesterday, "yesterday", identity, chat_type)
+                        # 检查并生成昨天的 yesterday_version
+                        yesterday_file = conv_dir / f"{yesterday}.json"
+                        if yesterday_file.exists():
+                            yesterday_data = self._read_file_directly(yesterday_file)
+                            # 只有当没有 yesterday_version 但有 today_version 时才生成
+                            if (self._has_version_content(yesterday_data, "today_version") and
+                                not self._has_version_content(yesterday_data, "yesterday_version")):
+                                logger.info(f"[DiaryManager] 为 {yesterday} 生成 yesterday_version")
+                                if await self.generate_version(stream_id, yesterday, "yesterday", identity, chat_type):
+                                    generated += 1
+                            else:
+                                skipped += 1
                         
-                        # 生成前天的 older_version
-                        if (conv_dir / f"{day_before}.json").exists():
-                            await self.generate_version(stream_id, day_before, "older", identity, chat_type)
+                        # 检查并生成前天的 older_version
+                        older_file = conv_dir / f"{day_before}.json"
+                        if older_file.exists():
+                            older_data = self._read_file_directly(older_file)
+                            # 只有当有内容但没有 older_version 时才生成
+                            has_source = (self._has_version_content(older_data, "today_version") or
+                                         self._has_version_content(older_data, "yesterday_version"))
+                            if has_source and not self._has_version_content(older_data, "older_version"):
+                                logger.info(f"[DiaryManager] 为 {day_before} 生成 older_version")
+                                if await self.generate_version(stream_id, day_before, "older", identity, chat_type):
+                                    generated += 1
+                            else:
+                                skipped += 1
                         
                         self._checked_conversations.add(stream_id)
                         
                     except Exception as e:
                         logger.error(f"[DiaryManager] 检查失败: {e}")
             
-            logger.info(f"[DiaryManager] 启动检查完成，处理了 {count} 个活跃对话")
+            logger.info(f"[DiaryManager] 启动检查完成，{count} 个对话，生成 {generated} 个版本，跳过 {skipped} 个已有版本")
 
     # ==================== 命令支持 ====================
     

@@ -13,6 +13,7 @@ from src.plugin_system.base.component_types import PermissionNodeField
 from .config_schema import CONFIG_SCHEMA
 from .core.diary_manager import DiaryManager
 from .handlers.diary_prompt import DiaryPromptComponent
+from .handlers.diary_message_handler import DiaryMessageHandler
 from .commands.diary_commands import DiaryCommand
 
 logger = get_logger("continuous_diary_plugin")
@@ -74,6 +75,21 @@ class ContinuousDiaryPlugin(BasePlugin):
         except Exception as e:
             logger.error(f"[ContinuousDiary] 启动检查失败: {e}", exc_info=True)
 
+        # 注册定时维护任务 (每 30 分钟检查一次)
+        try:
+            from src.plugin_system.apis.unified_scheduler import unified_scheduler, TriggerType
+            await unified_scheduler.create_schedule(
+                callback=self.manager.run_maintenance,
+                trigger_type=TriggerType.TIME,
+                trigger_config={"delay_seconds": 1800, "interval_seconds": 1800},
+                is_recurring=True,
+                task_name="continuous_diary_maintenance",
+                force_overwrite=True
+            )
+            logger.info("[ContinuousDiary] 已注册定时维护任务")
+        except Exception as e:
+            logger.error(f"[ContinuousDiary] 注册定时任务失败: {e}")
+
         logger.info("[ContinuousDiary] 连续日记式记忆系统已启动")
 
     async def on_plugin_unloaded(self):
@@ -101,6 +117,10 @@ class ContinuousDiaryPlugin(BasePlugin):
         # 2. 注册命令组件
         DiaryCommand.manager = self.manager  # type: ignore
         components.append((DiaryCommand.get_plus_command_info(), DiaryCommand))
+
+        # 3. 注册消息处理器
+        DiaryMessageHandler.manager = self.manager  # type: ignore
+        components.append((DiaryMessageHandler.get_handler_info(), DiaryMessageHandler))
 
         logger.info(f"[ContinuousDiary] 已注册 {len(components)} 个组件")
         return components
